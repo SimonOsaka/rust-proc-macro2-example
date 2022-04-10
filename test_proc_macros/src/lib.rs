@@ -1,15 +1,18 @@
+use heck::ToSnakeCase;
 use proc_macro::TokenStream;
-use proc_macro2::{Punct, Spacing};
-use quote::{quote, ToTokens, TokenStreamExt};
+use proc_macro2::{Ident, Span};
+use quote::{quote, ToTokens};
 use syn::{
     parse::{Parse, Parser},
     parse_macro_input,
     punctuated::Punctuated,
     token::Paren,
-    DeriveInput, Fields, FieldsUnnamed, ItemFn, ItemStruct, Lit, LitStr, Signature, Token,
+    DeriveInput, Fields, FieldsUnnamed, ItemFn, ItemStruct, LitStr, Signature, Token,
 };
 
 extern crate proc_macro;
+extern crate proc_macro2;
+extern crate quote;
 extern crate syn;
 
 #[proc_macro_derive(MyDerive)]
@@ -196,4 +199,254 @@ impl ToTokens for MyItem {
             });
         }
     }
+}
+
+/// ErrorMessage
+#[proc_macro_derive(ErrorMessage, attributes(error_message))]
+pub fn error_message_derive(input: TokenStream) -> TokenStream {
+    let ast: DeriveInput = parse_macro_input!(input as DeriveInput);
+    //
+    let name = &ast.ident;
+    //
+    let enum_data = if let syn::Data::Enum(data) = &ast.data {
+        data
+    } else {
+        panic!("{} is not an enum", name);
+    };
+    //
+    let mut stream = proc_macro2::TokenStream::new();
+
+    for variant_data in &enum_data.variants {
+        let variant_name = &variant_data.ident;
+        let function_name_ref = Ident::new(
+            &format!("as_{}", variant_name).to_snake_case(),
+            Span::call_site(),
+        );
+        let doc_ref = format!(
+            "Optionally returns references to the inner fields if this is a `{}::{}`, otherwise `None`",
+            name,
+            variant_name,
+        );
+        let function_name_val = Ident::new(
+            &format!("into_{}", variant_name).to_snake_case(),
+            Span::call_site(),
+        );
+        let doc_val = format!(
+            "Returns the inner fields if this is a `{}::{}`, otherwise returns back the enum in the `Err` case of the result",
+            name,
+            variant_name,
+        );
+        //
+        let tokens = match &variant_data.fields {
+            syn::Fields::Unit => {
+                println!("Unit {}", variant_name.to_string());
+                unit_fields_return(name, variant_name, &function_name_ref, &doc_ref)
+            }
+            syn::Fields::Unnamed(unnamed) => {
+                println!("Unnamed {}", name.to_string());
+                unnamed_fields_return(
+                    name,
+                    variant_name,
+                    (&function_name_ref, &doc_ref),
+                    (&function_name_val, &doc_val),
+                    &unnamed,
+                )
+            }
+            syn::Fields::Named(named) => {
+                println!("Named {}", name.to_string());
+                named_fields_return(
+                    name,
+                    variant_name,
+                    (&function_name_ref, &doc_ref),
+                    (&function_name_val, &doc_val),
+                    &named,
+                )
+            }
+        };
+        stream.extend(tokens);
+    }
+    quote! {
+        impl #name {
+            #stream
+        }
+    }
+    .into()
+}
+
+fn unit_fields_return(
+    name: &syn::Ident,
+    variant_name: &syn::Ident,
+    function_name: &Ident,
+    doc: &str,
+) -> proc_macro2::TokenStream {
+    quote!(
+        #[doc = #doc ]
+        pub fn #function_name(&self) -> Option<()> {
+            match self {
+                #name::#variant_name => {
+                    Some(())
+                }
+                _ => None
+            }
+        }
+    )
+}
+
+/// returns first the types to return, the match names, and then tokens to the field accesses
+fn unnamed_fields_return(
+    name: &syn::Ident,
+    variant_name: &syn::Ident,
+    (function_name_ref, doc_ref): (&Ident, &str),
+    (function_name_val, doc_val): (&Ident, &str),
+    fields: &syn::FieldsUnnamed,
+) -> proc_macro2::TokenStream {
+    let (returns_ref, returns_val, matches, accesses_ref, accesses_val) = match fields.unnamed.len()
+    {
+        1 => {
+            let field = fields.unnamed.first().expect("no fields on type");
+
+            let returns = &field.ty;
+            let returns_ref = quote!(&#returns);
+            let returns_val = quote!(#returns);
+            let matches = quote!(inner);
+            let accesses_ref = quote!(&inner);
+            let accesses_val = quote!(inner);
+
+            (
+                returns_ref,
+                returns_val,
+                matches,
+                accesses_ref,
+                accesses_val,
+            )
+        }
+        0 => (quote!(()), quote!(()), quote!(), quote!(()), quote!(())),
+        _ => {
+            let mut returns_ref = proc_macro2::TokenStream::new();
+            let mut returns_val = proc_macro2::TokenStream::new();
+            let mut matches = proc_macro2::TokenStream::new();
+            let mut accesses_ref = proc_macro2::TokenStream::new();
+            let mut accesses_val = proc_macro2::TokenStream::new();
+
+            for (i, field) in fields.unnamed.iter().enumerate() {
+                let rt = &field.ty;
+                let match_name = Ident::new(&format!("match_{}", i), Span::call_site());
+                returns_ref.extend(quote!(&#rt,));
+                returns_val.extend(quote!(#rt,));
+                matches.extend(quote!(#match_name,));
+                accesses_ref.extend(quote!(&#match_name,));
+                accesses_val.extend(quote!(#match_name,));
+            }
+
+            (
+                quote!((#returns_ref)),
+                quote!((#returns_val)),
+                quote!(#matches),
+                quote!((#accesses_ref)),
+                quote!((#accesses_val)),
+            )
+        }
+    };
+
+    quote!(
+        #[doc = #doc_ref ]
+        pub fn #function_name_ref(&self) -> Option<#returns_ref> {
+            match self {
+                #name::#variant_name(#matches) => {
+                    Some(#accesses_ref)
+                }
+                _ => None
+            }
+        }
+
+        #[doc = #doc_val ]
+        pub fn #function_name_val(self) -> ::core::result::Result<#returns_val, Self> {
+            match self {
+                #name::#variant_name(#matches) => {
+                    Ok(#accesses_val)
+                },
+                _ => Err(self)
+            }
+        }
+    )
+}
+
+/// returns first the types to return, the match names, and then tokens to the field accesses
+fn named_fields_return(
+    name: &syn::Ident,
+    variant_name: &syn::Ident,
+    (function_name_ref, doc_ref): (&Ident, &str),
+    (function_name_val, doc_val): (&Ident, &str),
+    fields: &syn::FieldsNamed,
+) -> proc_macro2::TokenStream {
+    let (returns_ref, returns_val, matches, accesses_ref, accesses_val) = match fields.named.len() {
+        1 => {
+            let field = fields.named.first().expect("no fields on type");
+            let match_name = field.ident.as_ref().expect("expected a named field");
+
+            let returns = &field.ty;
+            let returns_ref = quote!(&#returns);
+            let returns_val = quote!(#returns);
+            let matches = quote!(#match_name);
+            let accesses_ref = quote!(&#match_name);
+            let accesses_val = quote!(#match_name);
+
+            (
+                returns_ref,
+                returns_val,
+                matches,
+                accesses_ref,
+                accesses_val,
+            )
+        }
+        0 => (quote!(()), quote!(()), quote!(), quote!(()), quote!(())),
+        _ => {
+            let mut returns_ref = proc_macro2::TokenStream::new();
+            let mut returns_val = proc_macro2::TokenStream::new();
+            let mut matches = proc_macro2::TokenStream::new();
+            let mut accesses_ref = proc_macro2::TokenStream::new();
+            let mut accesses_val = proc_macro2::TokenStream::new();
+
+            for field in fields.named.iter() {
+                let rt = &field.ty;
+                let match_name = field.ident.as_ref().expect("expected a named field");
+
+                returns_ref.extend(quote!(&#rt,));
+                returns_val.extend(quote!(#rt,));
+                matches.extend(quote!(#match_name,));
+                accesses_ref.extend(quote!(&#match_name,));
+                accesses_val.extend(quote!(#match_name,));
+            }
+
+            (
+                quote!((#returns_ref)),
+                quote!((#returns_val)),
+                quote!(#matches),
+                quote!((#accesses_ref)),
+                quote!((#accesses_val)),
+            )
+        }
+    };
+
+    quote!(
+        #[doc = #doc_ref ]
+        pub fn #function_name_ref(&self) -> Option<#returns_ref> {
+            match self {
+                #name::#variant_name{ #matches } => {
+                    Some(#accesses_ref)
+                }
+                _ => None
+            }
+        }
+
+        #[doc = #doc_val ]
+        pub fn #function_name_val(self) -> ::core::result::Result<#returns_val, Self> {
+            match self {
+                #name::#variant_name{ #matches } => {
+                    Ok(#accesses_val)
+                }
+                _ => Err(self)
+            }
+        }
+    )
 }
